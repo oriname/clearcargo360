@@ -75,7 +75,7 @@ def handle_numeric_callsigns(df: pd.DataFrame) -> pd.DataFrame:
 
 def normalise_date(series: pd.Series) -> pd.Series:
     parsed = pd.to_datetime(series, errors="coerce", dayfirst=True)
-    fmt = parsed.dt.strftime(DATE_FMT).str.upper()
+    fmt = parsed.dt.strftime(DATE_FMT)
     return fmt.where(parsed.notna(), series)
 
 def load_mapping_and_alias(uploaded_file) -> tuple[dict, dict]:
