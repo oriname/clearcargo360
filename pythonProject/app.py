@@ -373,7 +373,7 @@ with tab2:
                     df2["__KEY"] = df2[awb_air].astype(str) + "-" + df2[awb_ser].astype(str)
                     key_description = "AWB Only"
                 
-                # Find duplicates
+                # Find duplicates #
                 duplicates_in_2 = df2[df2["__KEY"].isin(df1["__KEY"])].copy()
                 duplicates_in_1 = df1[df1["__KEY"].isin(df2["__KEY"])].copy()
                 
