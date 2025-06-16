@@ -76,6 +76,8 @@ def handle_numeric_callsigns(df: pd.DataFrame) -> pd.DataFrame:
 def normalise_date(series: pd.Series) -> pd.Series:
     parsed = pd.to_datetime(series, errors="coerce", dayfirst=True)
     fmt = parsed.dt.strftime(DATE_FMT)
+    # Capitalize only first letter of month: JUN -> Jun, AUG -> Aug
+    fmt = fmt.str.replace(r'-([A-Z]{3})-', lambda m: f'-{m.group(1).capitalize()}-', regex=True)
     return fmt.where(parsed.notna(), series)
 
 def load_mapping_and_alias(uploaded_file) -> tuple[dict, dict]:
