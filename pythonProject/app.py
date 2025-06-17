@@ -2,7 +2,7 @@
 import streamlit as st
 
 # MUST be the very first Streamlit command
-st.set_page_config(page_title="Air-Cargo Cleaner", layout="wide")
+st.set_page_config(page_title="ClearCargo360", layout="wide")
 
 # Now import everything else
 import io
@@ -302,6 +302,181 @@ def b64_download(data: bytes, filename: str, label: str):
     st.markdown(href, unsafe_allow_html=True)
 
 
+# FIXED: Improved header detection function
+def detect_has_headers(df_sample: pd.DataFrame) -> bool:
+    """
+    Improved logic to detect if a dataframe has proper headers
+    Returns True if headers are detected, False otherwise
+    """
+    if df_sample.empty:
+        return True  # Default to assuming headers
+
+    # Check 1: Are column names meaningful (contain expected keywords)?
+    header_keywords = ['awb', 'operator', 'cargo', 'flight', 'date', 'weight', 'airline', 'serial']
+    meaningful_headers = 0
+    for col in df_sample.columns:
+        col_str = str(col).lower()
+        if any(keyword in col_str for keyword in header_keywords):
+            meaningful_headers += 1
+
+    if meaningful_headers >= 2:  # At least 2 meaningful headers
+        return True
+
+    # Check 2: Are columns just numbers (0, 1, 2...)?
+    if all(isinstance(col, (int, float)) for col in df_sample.columns):
+        return False
+
+    # Check 3: Are columns like 'Unnamed: 0', 'Unnamed: 1'?
+    if all('unnamed' in str(col).lower() for col in df_sample.columns):
+        return False
+
+    # Check 4: Does first row contain typical airline data?
+    if len(df_sample) > 0:
+        first_row = df_sample.iloc[0]
+        airline_patterns = [
+            'AIR FRANCE', 'EMIRATES', 'QATAR', 'LUFTHANSA', 'DELTA',
+            'KLM', 'TURKISH', 'ETHIOPIAN', 'BRITISH', 'EUROPEAN AIR',
+            'AIR PEACE', 'VIRGIN', 'SOUTHWEST', 'AMERICAN'
+        ]
+
+        # Check if any cell in first row contains airline names
+        for val in first_row:
+            val_str = str(val).upper()
+            if any(airline in val_str for airline in airline_patterns):
+                return False  # First row contains data, not headers
+
+        # Check if first row has numeric patterns typical of AWB data
+        numeric_count = sum(1 for val in first_row if str(val).replace('.', '').replace('-', '').isdigit())
+        if numeric_count >= 3:  # If 3+ numeric values, likely data row
+            return False
+
+    # Default to True if unclear
+    return True
+
+
+def read_sheet_with_proper_headers(file, sheet_name):
+    """Read Excel sheet and intelligently handle missing headers"""
+    # Standard column names for air cargo data
+    expected_columns = [
+        'OperatorName', 'OperatorEFLegacyCode', 'OperatorAccountingCode',
+        'FlightDate', 'MonthCheckDigitManifest', 'CallSign_FlightNo',
+        'FromAirportCode', 'ToAirportCode', 'AWBDate', 'MonthCheckDigitAWB',
+        'AWBIssuingAirline', 'AWBSerialNumber', 'AWBCheckDigit', 'CargoWeight',
+        'RateKGM', 'FeesCargoTotalAmount', 'CurrencyCode', 'SyncedAt'
+    ]
+
+    # First, read a sample to inspect headers
+    df_sample = pd.read_excel(file, sheet_name=sheet_name, nrows=3)
+    has_proper_headers = detect_has_headers(df_sample)
+
+    # Now read the file properly
+    if has_proper_headers:
+        # File has headers, read normally
+        df = pd.read_excel(file, sheet_name=sheet_name)
+    else:
+        # File doesn't have headers, read without header row
+        df = pd.read_excel(file, sheet_name=sheet_name, header=None)
+
+        # Assign standard column names
+        num_cols = len(df.columns)
+        if num_cols >= len(expected_columns):
+            df.columns = expected_columns + [f'Extra_{i}' for i in range(num_cols - len(expected_columns))]
+        else:
+            df.columns = expected_columns[:num_cols]
+
+    return df, has_proper_headers
+
+
+# FIXED: Enhanced column finder with better fuzzy matching
+def find_best_match(df_columns, target_name, position_fallback=None):
+    """Find best matching column name with position fallback and fuzzy matching"""
+
+    # Define comprehensive column name variations
+    column_variations = {
+        "AWBIssuingAirline": [
+            "awbissuingairline", "awb_issuing_airline", "awb issuing airline",
+            "issuing airline", "awb airline", "awbairline", "awb_airline",
+            "airway bill issuing airline", "awb issuing", "issuing_airline"
+        ],
+        "AWBSerialNumber": [
+            "awbserialnumber", "awb_serial_number", "awb serial number",
+            "serial number", "awb serial", "awbserial", "awb_serial",
+            "airway bill serial", "awb_number", "awbnumber", "awb number"
+        ],
+        "CargoWeight": [
+            "cargoweight", "cargo_weight", "cargo weight", "weight",
+            "cargo wt", "wt", "cargo_wt", "weight_kg", "weightkg",
+            "cargo_weight_kg", "freight weight", "shipment weight"
+        ],
+        "OperatorName": [
+            "operatorname", "operator_name", "operator name", "airline",
+            "airline name", "carrier", "operator", "airline_name",
+            "carrier_name", "aviation operator"
+        ]
+    }
+
+    # Step 1: Exact match (case insensitive)
+    for col in df_columns:
+        if str(col).lower().strip() == target_name.lower():
+            return col
+
+    # Step 2: Try predefined variations
+    variations = column_variations.get(target_name, [target_name.lower()])
+    for variation in variations:
+        for col in df_columns:
+            col_clean = str(col).lower().strip().replace(' ', '').replace('_', '')
+            variation_clean = variation.replace(' ', '').replace('_', '')
+            if variation_clean in col_clean or col_clean in variation_clean:
+                return col
+
+    # Step 3: Position fallback if provided
+    if position_fallback is not None and 0 <= position_fallback < len(df_columns):
+        return df_columns[position_fallback]
+
+    return None
+
+
+# FIXED: Normalize data for comparison
+def normalize_awb_data(df, awb_airline_col, awb_serial_col, weight_col=None):
+    """Normalize AWB data for consistent comparison"""
+    df_norm = df.copy()
+
+    # Normalize AWB Airline - convert to string, strip whitespace, handle NaN
+    df_norm[awb_airline_col] = (df_norm[awb_airline_col]
+                                .fillna('')
+                                .astype(str)
+                                .str.strip()
+                                .str.replace(r'\.0$', '', regex=True))  # Remove .0 from floats
+
+    # Normalize AWB Serial - more robust handling
+    df_norm[awb_serial_col] = (df_norm[awb_serial_col]
+                               .fillna('')
+                               .astype(str)
+                               .str.strip()
+                               .str.replace(r'\.0$', '', regex=True)  # Remove .0 from floats
+                               .str.lstrip('0')  # Remove leading zeros
+                               .replace('', '0'))  # Replace empty strings with '0'
+
+    # Normalize weight if provided - more robust handling
+    if weight_col and weight_col in df_norm.columns:
+        df_norm[weight_col] = pd.to_numeric(df_norm[weight_col], errors='coerce').fillna(0).round(2)
+
+    return df_norm
+
+
+def create_comparison_key(airline, serial, weight=None):
+    """Create a standardized comparison key"""
+    # Clean and normalize components
+    airline_clean = str(airline).strip().replace('.0', '')
+    serial_clean = str(serial).strip().replace('.0', '').lstrip('0') or '0'
+
+    if weight is not None:
+        weight_clean = str(float(weight)).replace('.0', '') if pd.notna(weight) else '0'
+        return f"{airline_clean}-{serial_clean}-{weight_clean}"
+    else:
+        return f"{airline_clean}-{serial_clean}"
+
+
 # -----------------------  Streamlit UI  ------------------------------------ #
 st.title("📦 ClearCargo 360")
 st.markdown("#### *From manifest to money — reconciling air-cargo data for accurate billing.*")
@@ -342,7 +517,8 @@ with tab1:
 
             # Show European Air Transport filter results
             if not excluded_european.empty:
-                st.warning(f"⚠️ Excluded {len(excluded_european)} European Air Transport records with AWBIssuingAirline < 155")
+                st.warning(
+                    f"⚠️ Excluded {len(excluded_european)} European Air Transport records with AWBIssuingAirline < 155")
                 st.write("**Sample Excluded European Air Transport Records:**")
                 display_cols = ["AWBIssuingAirline", "OperatorName", "CallSign_FlightNo"]
                 if all(col in excluded_european.columns for col in display_cols):
@@ -405,106 +581,152 @@ with tab2:
     check_weight = st.checkbox("Include weight in duplicate check", value=True,
                                help="If checked, rows must have same AWB AND weight to be considered duplicates")
 
-    if st.button("🔍 Process", disabled=not (file1 and file2)):
+    # Header configuration options
+    st.markdown("**📋 Header Configuration**")
+    col1, col2 = st.columns(2)
+    with col1:
+        force_no_header1 = st.checkbox("File 1 has no headers", key="no_header1",
+                                       help="Check if first row contains data, not column names")
+    with col2:
+        force_no_header2 = st.checkbox("File 2 has no headers", key="no_header2",
+                                       help="Check if first row contains data, not column names")
+
+    # Preview button
+    if file1 and file2:
+        if st.button("Preview Data Structure", type="secondary"):
+            st.markdown("### 📊 Data Preview")
+
+            # Read files with header detection
+            try:
+                if force_no_header1:
+                    df1_preview = pd.read_excel(file1, sheet_name=sheet1, header=None, nrows=3)
+                    expected_columns = [
+                        'OperatorName', 'OperatorEFLegacyCode', 'OperatorAccountingCode',
+                        'FlightDate', 'MonthCheckDigitManifest', 'CallSign_FlightNo',
+                        'FromAirportCode', 'ToAirportCode', 'AWBDate', 'MonthCheckDigitAWB',
+                        'AWBIssuingAirline', 'AWBSerialNumber', 'AWBCheckDigit', 'CargoWeight',
+                        'RateKGM', 'FeesCargoTotalAmount', 'CurrencyCode', 'SyncedAt'
+                    ]
+                    df1_preview.columns = expected_columns[:len(df1_preview.columns)]
+                    has_headers1 = False
+                else:
+                    df1_preview, has_headers1 = read_sheet_with_proper_headers(file1, sheet1)
+                    df1_preview = df1_preview.head(3)
+
+                if force_no_header2:
+                    df2_preview = pd.read_excel(file2, sheet_name=sheet2, header=None, nrows=3)
+                    expected_columns = [
+                        'OperatorName', 'OperatorEFLegacyCode', 'OperatorAccountingCode',
+                        'FlightDate', 'MonthCheckDigitManifest', 'CallSign_FlightNo',
+                        'FromAirportCode', 'ToAirportCode', 'AWBDate', 'MonthCheckDigitAWB',
+                        'AWBIssuingAirline', 'AWBSerialNumber', 'AWBCheckDigit', 'CargoWeight',
+                        'RateKGM', 'FeesCargoTotalAmount', 'CurrencyCode', 'SyncedAt'
+                    ]
+                    df2_preview.columns = expected_columns[:len(df2_preview.columns)]
+                    has_headers2 = False
+                else:
+                    df2_preview, has_headers2 = read_sheet_with_proper_headers(file2, sheet2)
+                    df2_preview = df2_preview.head(3)
+
+                # Show previews with column indices and header detection results
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.markdown(
+                        f"**File 1 Structure** ({'Headers Detected' if has_headers1 else 'No Headers Detected'}):")
+                    preview_df1 = df1_preview.copy()
+                    preview_df1.columns = [f"[{i}] {col}" for i, col in enumerate(preview_df1.columns)]
+                    st.dataframe(preview_df1)
+
+                with col2:
+                    st.markdown(
+                        f"**File 2 Structure** ({'Headers Detected' if has_headers2 else 'No Headers Detected'}):")
+                    preview_df2 = df2_preview.copy()
+                    preview_df2.columns = [f"[{i}] {col}" for i, col in enumerate(preview_df2.columns)]
+                    st.dataframe(preview_df2)
+
+            except Exception as e:
+                st.error(f"Error previewing files: {e}")
+
+    if st.button("🔍 Find Duplicates", disabled=not (file1 and file2)):
         try:
-            # Read the selected sheets with header detection
-            def read_sheet_with_proper_headers(file, sheet_name):
-                """Read Excel sheet and handle missing headers"""
-                # Try reading normally first
-                df = pd.read_excel(file, sheet_name=sheet_name)
+            # Read files with improved header detection
+            if force_no_header1:
+                df1 = pd.read_excel(file1, sheet_name=sheet1, header=None)
+                expected_columns = [
+                    'OperatorName', 'OperatorEFLegacyCode', 'OperatorAccountingCode',
+                    'FlightDate', 'MonthCheckDigitManifest', 'CallSign_FlightNo',
+                    'FromAirportCode', 'ToAirportCode', 'AWBDate', 'MonthCheckDigitAWB',
+                    'AWBIssuingAirline', 'AWBSerialNumber', 'AWBCheckDigit', 'CargoWeight',
+                    'RateKGM', 'FeesCargoTotalAmount', 'CurrencyCode', 'SyncedAt'
+                ]
+                num_cols = len(df1.columns)
+                if num_cols >= len(expected_columns):
+                    df1.columns = expected_columns + [f'Extra_{i}' for i in range(num_cols - len(expected_columns))]
+                else:
+                    df1.columns = expected_columns[:num_cols]
+                has_headers1 = False
+            else:
+                df1, has_headers1 = read_sheet_with_proper_headers(file1, sheet1)
 
-                # Check if this looks like a file without headers (data in first row)
-                if len(df.columns) >= 17:  # We expect at least 17 columns
-                    first_col_name = str(df.columns[0])
-                    # If first column name looks like airline data, assume no headers
-                    if any(airline in first_col_name.upper() for airline in
-                           ['AIR FRANCE', 'EMIRATES', 'QATAR', 'LUFTHANSA', 'DELTA']):
-                        # Read without headers and assign proper column names
-                        df_no_header = pd.read_excel(file, sheet_name=sheet_name, header=None)
+            if force_no_header2:
+                df2 = pd.read_excel(file2, sheet_name=sheet2, header=None)
+                expected_columns = [
+                    'OperatorName', 'OperatorEFLegacyCode', 'OperatorAccountingCode',
+                    'FlightDate', 'MonthCheckDigitManifest', 'CallSign_FlightNo',
+                    'FromAirportCode', 'ToAirportCode', 'AWBDate', 'MonthCheckDigitAWB',
+                    'AWBIssuingAirline', 'AWBSerialNumber', 'AWBCheckDigit', 'CargoWeight',
+                    'RateKGM', 'FeesCargoTotalAmount', 'CurrencyCode', 'SyncedAt'
+                ]
+                num_cols = len(df2.columns)
+                if num_cols >= len(expected_columns):
+                    df2.columns = expected_columns + [f'Extra_{i}' for i in range(num_cols - len(expected_columns))]
+                else:
+                    df2.columns = expected_columns[:num_cols]
+                has_headers2 = False
+            else:
+                df2, has_headers2 = read_sheet_with_proper_headers(file2, sheet2)
 
-                        # Standard column names based on the cargo data structure
-                        expected_columns = [
-                            'OperatorName', 'OperatorEFLegacyCode', 'OperatorAccountingCode',
-                            'FlightDate', 'MonthCheckDigitManifest', 'CallSign_FlightNo',
-                            'FromAirportCode', 'ToAirportCode', 'AWBDate', 'MonthCheckDigitAWB',
-                            'AWBIssuingAirline', 'AWBSerialNumber', 'AWBCheckDigit', 'CargoWeight',
-                            'RateKGM', 'FeesCargoTotalAmount', 'CurrencyCode', 'SyncedAt'
-                        ]
+            # Display header status
+            col1, col2 = st.columns(2)
+            with col1:
+                if has_headers1 or force_no_header1:
+                    st.success(f"✓ File 1: {'Forced no headers' if force_no_header1 else 'Headers detected'}")
+                else:
+                    st.warning(f"⚠️ File 1: No headers detected - applied standard columns")
 
-                        # Assign column names (handle cases where there might be fewer/more columns)
-                        num_cols = len(df_no_header.columns)
-                        if num_cols >= len(expected_columns):
-                            df_no_header.columns = expected_columns + [f'Extra_{i}' for i in
-                                                                       range(num_cols - len(expected_columns))]
-                        else:
-                            df_no_header.columns = expected_columns[:num_cols]
+            with col2:
+                if has_headers2 or force_no_header2:
+                    st.success(f"✓ File 2: {'Forced no headers' if force_no_header2 else 'Headers detected'}")
+                else:
+                    st.warning(f"⚠️ File 2: No headers detected - applied standard columns")
 
-                        return df_no_header
+            # Debug: Show first few rows of actual data
+            # st.markdown("### 🔍 Data Sample Check")
+            # col1, col2 = st.columns(2)
+            # with col1:
+            #     st.markdown("**File 1 Sample:**")
+            #     sample_cols = ['AWBIssuingAirline', 'AWBSerialNumber',
+            #                    'CargoWeight'] if 'AWBIssuingAirline' in df1.columns else df1.columns[:5]
+            #     st.dataframe(df1[sample_cols].head(3))
+            # with col2:
+            #     st.markdown("**File 2 Sample:**")
+            #     sample_cols = ['AWBIssuingAirline', 'AWBSerialNumber',
+            #                    'CargoWeight'] if 'AWBIssuingAirline' in df2.columns else df2.columns[:5]
+            #     st.dataframe(df2[sample_cols].head(3))
 
-                return df
-
-
-            df1 = read_sheet_with_proper_headers(file1, sheet1)
-            df2 = read_sheet_with_proper_headers(file2, sheet2)
-
-            # Debug: Show basic info about the dataframes
-            #st.write("**Debug - DataFrame Info:**")
-            #st.write(f"File 1 - Shape: {df1.shape}, Sheet: {sheet1}")
-            #st.write(f"File 2 - Shape: {df2.shape}, Sheet: {sheet2}")
-
-            # Normalize column names (handle both string and numeric column names)
+            # Normalize column names
             df1.columns = [str(c).strip() if isinstance(c, str) else str(c) for c in df1.columns]
             df2.columns = [str(c).strip() if isinstance(c, str) else str(c) for c in df2.columns]
 
-            # Debug: Show first few rows to see if data structure is correct
-            #st.write("**Debug - First few rows:**")
-            #st.write("File 1:")
-            #st.dataframe(df1.head(3))
-            #st.write("File 2:")
-            #st.dataframe(df2.head(3))
-
-            # Debug: Show actual column names
-            #st.write("**Debug - Actual Column Names:**")
-            #st.write(f"File 1 columns: {list(df1.columns)}")
-            #st.write(f"File 2 columns: {list(df2.columns)}")
-
-
-            # Try to find matching columns with case-insensitive search
-            def find_column(df_columns, target_name):
-                """Find column by case-insensitive partial match"""
-                target_lower = target_name.lower()
-                for col in df_columns:
-                    if target_lower in str(col).lower():
-                        return col
-                return None
-
-
-            # Map actual column names to expected ones
-            required_mapping = {
-                "AWBIssuingAirline": ["awbissuingairline", "awb_issuing_airline", "awb issuing airline",
-                                      "issuing airline"],
-                "AWBSerialNumber": ["awbserialnumber", "awb_serial_number", "awb serial number", "serial number"],
-                "CargoWeight": ["cargoweight", "cargo_weight", "cargo weight", "weight"]
+            # Enhanced column mapping with position fallback
+            position_map = {
+                "AWBIssuingAirline": 10,
+                "AWBSerialNumber": 11,
+                "CargoWeight": 13
             }
 
-
-            def find_best_match(df_columns, target_name):
-                """Find best matching column name"""
-                # First try exact match (case insensitive)
-                for col in df_columns:
-                    if str(col).lower() == target_name.lower():
-                        return col
-
-                # Then try partial matches
-                possible_names = required_mapping.get(target_name, [target_name.lower()])
-                for possible in possible_names:
-                    for col in df_columns:
-                        if possible in str(col).lower():
-                            return col
-                return None
-
-
-            # Find actual column names
+            # Map actual column names to expected ones
             required_cols = ["AWBIssuingAirline", "AWBSerialNumber"]
             if check_weight:
                 required_cols.append("CargoWeight")
@@ -516,26 +738,51 @@ with tab2:
 
             for req_col in required_cols:
                 # File 1
-                actual_col_1 = find_best_match(df1.columns, req_col)
+                pos_fallback = position_map.get(req_col)
+                actual_col_1 = find_best_match(df1.columns, req_col, pos_fallback)
                 if actual_col_1:
                     column_mapping_1[req_col] = actual_col_1
                 else:
                     missing_cols_1.append(req_col)
 
                 # File 2
-                actual_col_2 = find_best_match(df2.columns, req_col)
+                actual_col_2 = find_best_match(df2.columns, req_col, pos_fallback)
                 if actual_col_2:
                     column_mapping_2[req_col] = actual_col_2
                 else:
                     missing_cols_2.append(req_col)
 
+            # # Show column mapping results
+            # st.markdown("### 📋 Column Mapping Results")
+            # col1, col2 = st.columns(2)
+            # with col1:
+            #     st.markdown("**File 1 Mapping:**")
+            #     for req, actual in column_mapping_1.items():
+            #         st.success(f"✓ {req} → {actual}")
+            #     if missing_cols_1:
+            #         for missing in missing_cols_1:
+            #             st.error(f"✗ {missing} → NOT FOUND")
+            #
+            # with col2:
+            #     st.markdown("**File 2 Mapping:**")
+            #     for req, actual in column_mapping_2.items():
+            #         st.success(f"✓ {req} → {actual}")
+            #     if missing_cols_2:
+            #         for missing in missing_cols_2:
+            #             st.error(f"✗ {missing} → NOT FOUND")
+
+            # If still missing columns after position fallback, show error
             if missing_cols_1 or missing_cols_2:
-                st.error(f"Missing columns - File 1: {missing_cols_1}, File 2: {missing_cols_2}")
-                st.info(
-                    "Required columns: AWBIssuingAirline, AWBSerialNumber" + (", CargoWeight" if check_weight else ""))
-                st.write("**Column Mappings Found:**")
-                st.write(f"File 1: {column_mapping_1}")
-                st.write(f"File 2: {column_mapping_2}")
+                st.error("❌ Unable to find all required columns")
+                st.warning("💡 Try checking the 'has no headers' option if columns aren't being detected correctly")
+
+                # Show available columns for debugging
+                st.markdown("**Available Columns for Reference:**")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write("File 1:", list(df1.columns))
+                with col2:
+                    st.write("File 2:", list(df2.columns))
             else:
                 # Use mapped column names for comparison
                 awb_air_1 = column_mapping_1["AWBIssuingAirline"]
@@ -543,64 +790,220 @@ with tab2:
                 awb_air_2 = column_mapping_2["AWBIssuingAirline"]
                 awb_ser_2 = column_mapping_2["AWBSerialNumber"]
 
+                # Normalize data before comparison
+                df1_norm = normalize_awb_data(df1, awb_air_1, awb_ser_1,
+                                              column_mapping_1.get("CargoWeight") if check_weight else None)
+                df2_norm = normalize_awb_data(df2, awb_air_2, awb_ser_2,
+                                              column_mapping_2.get("CargoWeight") if check_weight else None)
+
+                # Create comparison keys using the improved function
                 if check_weight:
                     wt_1 = column_mapping_1["CargoWeight"]
                     wt_2 = column_mapping_2["CargoWeight"]
-                    df1["__KEY"] = df1[awb_air_1].astype(str) + "-" + df1[awb_ser_1].astype(str) + "-" + df1[
-                        wt_1].astype(str)
-                    df2["__KEY"] = df2[awb_air_2].astype(str) + "-" + df2[awb_ser_2].astype(str) + "-" + df2[
-                        wt_2].astype(str)
+
+                    # Create keys using the create_comparison_key function
+                    df1_keys = []
+                    df2_keys = []
+
+                    for _, row in df1_norm.iterrows():
+                        key = create_comparison_key(row[awb_air_1], row[awb_ser_1], row[wt_1])
+                        df1_keys.append(key)
+
+                    for _, row in df2_norm.iterrows():
+                        key = create_comparison_key(row[awb_air_2], row[awb_ser_2], row[wt_2])
+                        df2_keys.append(key)
+
+                    df1_norm["__KEY"] = df1_keys
+                    df2_norm["__KEY"] = df2_keys
                     key_description = "AWB + Weight"
                 else:
-                    df1["__KEY"] = df1[awb_air_1].astype(str) + "-" + df1[awb_ser_1].astype(str)
-                    df2["__KEY"] = df2[awb_air_2].astype(str) + "-" + df2[awb_ser_2].astype(str)
+                    # Create keys using only AWB data
+                    df1_keys = []
+                    df2_keys = []
+
+                    for _, row in df1_norm.iterrows():
+                        key = create_comparison_key(row[awb_air_1], row[awb_ser_1])
+                        df1_keys.append(key)
+
+                    for _, row in df2_norm.iterrows():
+                        key = create_comparison_key(row[awb_air_2], row[awb_ser_2])
+                        df2_keys.append(key)
+
+                    df1_norm["__KEY"] = df1_keys
+                    df2_norm["__KEY"] = df2_keys
                     key_description = "AWB Only"
 
-                # Find duplicates #
-                duplicates_in_2 = df2[df2["__KEY"].isin(df1["__KEY"])].copy()
-                duplicates_in_1 = df1[df1["__KEY"].isin(df2["__KEY"])].copy()
+                # Debug: Show sample keys with components
+                # st.markdown("### 🔑 Sample Comparison Keys")
+                # col1, col2 = st.columns(2)
+                # with col1:
+                #     st.markdown("**File 1 Keys:**")
+                #     display_cols = ["__KEY", awb_air_1, awb_ser_1]
+                #     if check_weight:
+                #         display_cols.append(wt_1)
+                #     sample_keys_1 = df1_norm[display_cols].head(5)
+                #     st.dataframe(sample_keys_1)
+                #
+                # with col2:
+                #     st.markdown("**File 2 Keys:**")
+                #     display_cols = ["__KEY", awb_air_2, awb_ser_2]
+                #     if check_weight:
+                #         display_cols.append(wt_2)
+                #     sample_keys_2 = df2_norm[display_cols].head(5)
+                #     st.dataframe(sample_keys_2)
+                #
+                # # Find duplicates with detailed logging
+                # st.markdown("### 🔄 Finding Matches...")
 
-                # Remove the temporary key column
-                duplicates_in_1.drop(columns=["__KEY"], inplace=True)
-                duplicates_in_2.drop(columns=["__KEY"], inplace=True)
+                # Get unique keys from both files
+                keys_1 = set(df1_norm["__KEY"].dropna())
+                keys_2 = set(df2_norm["__KEY"].dropna())
 
-                # Display results
+                # Find intersection
+                matching_keys = keys_1 & keys_2
+
+                # st.write(f"**Unique keys in File 1:** {len(keys_1)}")
+                # st.write(f"**Unique keys in File 2:** {len(keys_2)}")
+                # st.write(f"**Matching keys found:** {len(matching_keys)}")
+
+                # Keys comparison logic (hidden for cleaner UI)
+                # if len(matching_keys) > 0:
+                #     st.success("✅ Found matching keys!")
+                #     st.write("**Sample matching keys:**")
+                #     for key in list(matching_keys)[:5]:
+                #         st.write(f"- `{key}`")
+                # else:
+                #     st.warning("⚠️ No matching keys found")
+                #
+                #     # Show some keys from each file for comparison
+                #     st.write("**Sample keys from File 1:**")
+                #     for key in list(keys_1)[:5]:
+                #         st.write(f"- `{key}`")
+                #
+                #     st.write("**Sample keys from File 2:**")
+                #     for key in list(keys_2)[:5]:
+                #         st.write(f"- `{key}`")
+
+                # Find actual duplicate rows
+                duplicates_in_2 = df2[df2_norm["__KEY"].isin(df1_norm["__KEY"])].copy()
+                duplicates_in_1 = df1[df1_norm["__KEY"].isin(df2_norm["__KEY"])].copy()
+
                 st.markdown("---")
-                st.markdown("### 📊 Duplicate Analysis Results")
+                st.markdown("### 📊 Final Results")
 
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.metric("File 1 Total Rows", len(df1))
+                    st.metric("File 1 Total", len(df1))
                 with col2:
-                    st.metric("File 2 Total Rows", len(df2))
+                    st.metric("File 2 Total", len(df2))
+                # with col3:
+                #     st.metric("Matching Keys", len(matching_keys))
                 with col3:
-                    st.metric("Duplicate Pairs Found", len(duplicates_in_1))
+                    st.metric("Duplicate Records", len(duplicates_in_1))
 
                 st.info(f"**Comparison Method:** {key_description}")
 
                 if len(duplicates_in_1) > 0:
-                    st.warning(f"⚠️ Found {len(duplicates_in_1)} duplicate records!")
+                    st.success(f"🎯 Found {len(duplicates_in_1)} duplicate records!")
 
-                    # Show sample duplicates
-                    st.markdown("**🔍 Sample Duplicates (from File 1):**")
-                    display_cols = [awb_air_1, awb_ser_1]
-                    if check_weight:
-                        display_cols.append(wt_1)
-                    if "OperatorName" in duplicates_in_1.columns:
-                        display_cols.append("OperatorName")
+                    # Show sample duplicates with comparison keys
+                    st.markdown("### 📋 Matching Records Found")
 
-                    st.dataframe(duplicates_in_1[display_cols].head(10))
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("**Duplicates from File 1:**")
+                        display_cols_1 = [awb_air_1, awb_ser_1]
+                        if check_weight and wt_1:
+                            display_cols_1.append(wt_1)
+                        if "OperatorName" in duplicates_in_1.columns:
+                            display_cols_1.append("OperatorName")
+
+                        # Add the comparison key to see what matched
+                        dup_with_keys_1 = duplicates_in_1.copy()
+                        dup_with_keys_1["Comparison_Key"] = df1_norm.loc[duplicates_in_1.index, "__KEY"]
+                        display_cols_1.append("Comparison_Key")
+                        st.dataframe(dup_with_keys_1[display_cols_1].head(10))
+
+                    with col2:
+                        st.markdown("**Duplicates from File 2:**")
+                        display_cols_2 = [awb_air_2, awb_ser_2]
+                        if check_weight and wt_2:
+                            display_cols_2.append(wt_2)
+                        if "OperatorName" in duplicates_in_2.columns:
+                            display_cols_2.append("OperatorName")
+
+                        # Add the comparison key to see what matched
+                        dup_with_keys_2 = duplicates_in_2.copy()
+                        dup_with_keys_2["Comparison_Key"] = df2_norm.loc[duplicates_in_2.index, "__KEY"]
+                        display_cols_2.append("Comparison_Key")
+                        st.dataframe(dup_with_keys_2[display_cols_2].head(10))
 
                     # Create downloadable report
-                    duplicate_report = create_duplicate_report(duplicates_in_1, duplicates_in_2, file1.name, file2.name,
-                                                               key_description)
+                    duplicate_report = create_duplicate_report(
+                        duplicates_in_1, duplicates_in_2,
+                        file1.name, file2.name, key_description
+                    )
 
-                    b64_download(duplicate_report, f"duplicate_report_{file1.name}_{file2.name}.xlsx",
-                                 "⬇️ Download Full Duplicate Report")
+                    b64_download(
+                        duplicate_report,
+                        f"duplicate_report_{file1.name}_{file2.name}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                        "⬇️ Download Full Duplicate Report"
+                    )
 
                 else:
-                    st.success("✅ No duplicates found between the two files!")
+                    st.warning("❌ No matching records found between the files!")
+
+                    # Enhanced debugging when no duplicates found
+                    st.markdown("### 🔧 Troubleshooting Information")
+
+                    # Show exact key comparisons
+                    st.markdown("**🔍 Key Format Analysis:**")
+                    col1, col2 = st.columns(2)
+
+                    with col1:
+                        st.write("**File 1 - First 10 keys:**")
+                        keys_list_1 = list(keys_1)[:10]
+                        for i, key in enumerate(keys_list_1):
+                            st.write(f"{i + 1}. `{key}`")
+
+                    with col2:
+                        st.write("**File 2 - First 10 keys:**")
+                        keys_list_2 = list(keys_2)[:10]
+                        for i, key in enumerate(keys_list_2):
+                            st.write(f"{i + 1}. `{key}`")
+
+                    # Check for similar keys (debugging)
+                    st.markdown("**🔍 Similarity Check:**")
+                    similar_found = False
+                    sample_keys_1 = list(keys_1)[:5]
+                    sample_keys_2 = list(keys_2)[:5]
+
+                    for k1 in sample_keys_1:
+                        for k2 in sample_keys_2:
+                            # Check if keys are similar (same components but different formatting)
+                            k1_parts = k1.split('-')
+                            k2_parts = k2.split('-')
+                            if len(k1_parts) == len(k2_parts):
+                                similarity = sum(1 for a, b in zip(k1_parts, k2_parts) if a == b)
+                                if similarity >= len(k1_parts) - 1:  # Allow 1 difference
+                                    st.warning(
+                                        f"Similar keys found: `{k1}` vs `{k2}` (similarity: {similarity}/{len(k1_parts)})")
+                                    similar_found = True
+
+                    if not similar_found:
+                        st.info("No similar keys detected. The data in both files appears to be completely different.")
+
+                        # Suggest alternative comparison methods
+                        st.markdown("**💡 Suggestions:**")
+                        st.write("1. Try unchecking 'Include weight' to compare only AWB numbers")
+                        st.write("2. Verify you're comparing the correct sheets")
+                        st.write("3. Check if data formatting is consistent between files")
+                        st.write("4. Ensure both files contain the same type of records")
 
         except Exception as e:
             st.error(f"Duplicate check failed: {e}")
             st.exception(e)
+
+# Add a footer
+st.markdown("---")
+st.markdown("##### Built with ❤️ for air cargo reconciliation")
